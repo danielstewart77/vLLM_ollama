@@ -1,0 +1,17 @@
+services:
+  openai-proxy:
+    build: .
+    container_name: vllm
+    ports:
+      - "3000:3000"  # FastAPI
+      - "7000:7000"  # vLLM
+    environment:
+      VLLM_BASE_URL: http://localhost:7000  # Updated URL
+    volumes:
+      - ./hf_cache:/root/.cache/huggingface  # Persistent model cache
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
