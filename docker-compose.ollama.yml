@@ -1,21 +1,52 @@
-
-
 services:
-  openai-proxy:
-    build:
-      context: .
-      dockerfile: Dockerfile.ollama
+  vllm:
+    image: vllm/vllm-openai:latest
     container_name: vllm
-    ports:
-      - "3000:3000"  # FastAPI
-      - "7000:7000"  # vLLM
+    command: >
+      --model ibm-granite/granite-3.3-8b-instruct
+      --served-model-name ibm-granite/granite-3.3-8b-instruct \
+      --served-model-name ibm-granite/granite-3.3-8b-instruct:latest
+      --host 0.0.0.0
+      --port 7000
+      --tensor-parallel-size 2
+      --dtype bfloat16
+      --gpu-memory-utilization 0.70
+      --max-model-len 16384
+      --max-num-seqs 4
+      --max-num-batched-tokens 16384
+      --enforce-eager
+      --trust-remote-code
     environment:
-      VLLM_BASE_URL: http://localhost:7000  # Updated URL
-    volumes:
-      - ./hf_cache:/root/.cache/huggingface  # Persistent model cache
+      - CUDA_VISIBLE_DEVICES=0,1
+      - NCCL_DEBUG=INFO
+      - NCCL_IB_DISABLE=1
+      # If shm still fills up, uncomment:
+      # - NCCL_SHM_DISABLE=1
     runtime: nvidia
     deploy:
       resources:
         reservations:
           devices:
             - capabilities: [gpu]
+    shm_size: "16g"
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    volumes:
+      - ./hf_cache:/root/.cache/huggingface
+    ports:
+      - "7000:7000"
+
+  ollama-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.ollama
+    container_name: ollama-proxy
+    environment:
+      - VLLM_BASE_URL=http://vllm:7000
+    depends_on:
+      - vllm
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./hf_cache:/root/.cache/huggingface

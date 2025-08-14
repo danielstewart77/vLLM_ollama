@@ -47,6 +47,15 @@ def _map_ollama_options_to_openai(opts: Dict[str, Any]) -> Dict[str, Any]:
     if "repetition_penalty" in opts: out["frequency_penalty"] = float(opts["repetition_penalty"])  # best-effort
     return out
 
+def _passthrough_or_json(resp: httpx.Response):
+    if resp.status_code >= 400:
+        return PlainTextResponse(resp.text or resp.content, status_code=resp.status_code,
+                                 media_type=resp.headers.get("content-type","text/plain"))
+    try:
+        return JSONResponse(resp.json(), status_code=resp.status_code)
+    except Exception:
+        return PlainTextResponse(resp.text, status_code=resp.status_code)
+
 async def _retry_request(method: str, url: str, **kwargs) -> httpx.Response:
     assert client is not None
     max_retries, backoff = 5, 0.5
@@ -160,7 +169,84 @@ async def _stream_openai_to_ollama_generate(
             }
             yield (json.dumps(out) + "\n").encode("utf-8")
 
+def _normalize_model_id(name: str) -> str:
+    # Accept things like "model:latest" or "model:Q4_K_M"
+    # vLLM typically serves the base id (left of the first colon).
+    return (name or "").split(":", 1)[0]
+
+
 # ---------- Ollama-compatible routes ----------
+
+@app.get("/api/tags")
+async def api_tags():
+    """
+    Ollama-style tags:
+      { "models": [ { "name": "model:tag", "model": "model", ... }, ... ] }
+    We map from /v1/models ids and synthesize minimal metadata.
+    """
+    r = await _retry_request("GET", f"{VLLM_BASE_URL}/v1/models")
+    try:
+        data = r.json()
+    except Exception:
+        return PlainTextResponse(r.text, status_code=r.status_code)
+
+    models = []
+    for m in data.get("data", []):
+        name = m.get("id", "")
+        if not name:
+            continue
+        base = name.split(":", 1)[0]  # best-effort base name
+        models.append({
+            "name": name,
+            "model": base,
+            "modified_at": _now_iso(),
+            "size": 0,
+            "digest": "",
+            "details": {"parent_model": "", "format": "pytorch", "families": []},
+        })
+    return JSONResponse({"models": models}, status_code=r.status_code)
+
+# Some UIs call /api/models; mirror /api/tags for compatibility.
+@app.get("/api/models")
+async def api_models():
+    return await api_tags()
+
+
+@app.get("/api/version")
+async def api_version():
+    # Mimic Ollama's version format
+    return {"version": "0.1.0-proxy"}
+
+@app.get("/api/ps")
+async def api_ps():
+    # Minimal process list; Ollama returns running models.
+    # We'll map to available models for now.
+    # If you want true "running" semantics, we can track active sessions.
+    r = await _retry_request("GET", f"{VLLM_BASE_URL}/v1/models")
+    try:
+        data = r.json()
+    except Exception:
+        # Pass upstream error through
+        return PlainTextResponse(r.text, status_code=r.status_code)
+    procs = [{"model": m.get("id", ""), "size": 0, "digest": ""} for m in data.get("data", [])]
+    return {"models": procs}
+
+@app.post("/api/show")
+async def api_show(request: Request):
+    # Ollama usually accepts {"name":"model"} and returns metadata.
+    body = await request.json()
+    name = body.get("name") or body.get("model") or ""
+    if not name:
+        return JSONResponse({"error": "missing model name"}, status_code=400)
+    # Best-effort metadata
+    return {
+        "model": name,
+        "modified_at": _now_iso(),
+        "size": 0,
+        "digest": "",
+        "details": {"parent_model": "", "format": "pytorch", "families": []},
+    }
+
 
 @app.post("/api/chat")
 async def api_chat(request: Request):
@@ -176,7 +262,8 @@ async def api_chat(request: Request):
     Final line includes {"done": true, stats...}
     """
     body = await request.json()
-    model = body.get("model", "")
+    model_in = body.get("model", "")
+    model = _normalize_model_id(model_in)
     messages = body.get("messages", [])
     stream = bool(body.get("stream", True))
     options = body.get("options", {}) or {}
@@ -236,7 +323,8 @@ async def api_generate(request: Request):
     }
     """
     body = await request.json()
-    model = body.get("model", "")
+    model_in = body.get("model", "")
+    model = _normalize_model_id(model_in)
     prompt = body.get("prompt", "")
     stream = bool(body.get("stream", True))
     options = body.get("options", {}) or {}
@@ -289,7 +377,8 @@ async def api_embeddings(request: Request):
     Ollama also accepts { "prompt": "..." }. We'll accept either.
     """
     body = await request.json()
-    model = body.get("model", "")
+    model_in = body.get("model", "")
+    model = _normalize_model_id(model_in)
     inp = body.get("input") or body.get("prompt") or ""
     if isinstance(inp, list):
         input_list = inp
@@ -312,22 +401,6 @@ async def api_embeddings(request: Request):
         return JSONResponse({"model": model, "embedding": embeddings[0]}, status_code=upstream.status_code)
     else:
         return JSONResponse({"model": model, "embeddings": embeddings}, status_code=upstream.status_code)
-
-@app.get("/api/tags")
-async def api_tags():
-    """
-    Ollama-style tags:
-      { "models": [ { "name": "model:tag" }, ... ] }
-    We'll map from /v1/models ids.
-    """
-    r = await _retry_request("GET", f"{VLLM_BASE_URL}/v1/models")
-    try:
-        data = r.json()
-    except Exception:
-        return PlainTextResponse(r.text, status_code=r.status_code)
-
-    models = [{"name": m.get("id", "")} for m in data.get("data", []) if m.get("id")]
-    return JSONResponse({"models": models}, status_code=r.status_code)
 
 # Optional health
 @app.get("/healthz")

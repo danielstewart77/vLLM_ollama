@@ -8,7 +8,7 @@ python3 -m vllm.entrypoints.openai.api_server \
   --model ibm-granite/granite-3.3-8b-instruct \
   --port 7000 \
   --max-model-len 16384 \
-  --gpu-memory-utilization 0.90 \
+  --gpu-memory-utilization 0.50 \
   --max-num-seqs 4 \
   --max-num-batched-tokens 16384 \
   --disable-log-stats \
