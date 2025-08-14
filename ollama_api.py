@@ -16,33 +16,7 @@ app.add_middleware(
 )
 
 client: Optional[httpx.AsyncClient] = None
-_last_calls = []  # tiny in-memory ring for quick debugging
-
-@app.middleware("http")
-async def _log_every_request(request: Request, call_next):
-    try:
-        body = None
-        if request.method in ("POST", "PUT", "PATCH"):
-            body = await request.body()
-        _last_calls.append({
-            "ts": time.time(),
-            "method": request.method,
-            "path": request.url.path,
-            "query": str(request.url.query),
-            "body": (body.decode("utf-8", errors="ignore") if body else None)[:512],
-        })
-        # keep last 30
-        if len(_last_calls) > 30:
-            del _last_calls[:-30]
-        # re-inject body for downstream handlers
-        async def bodygen():
-            if body is not None:
-                yield body
-        request._receive = lambda: asyncio.get_event_loop().create_task(asyncio.sleep(0))  # type: ignore
-        response = await call_next(request)
-        return response
-    except Exception:
-        return await call_next(request)
+_last_calls = []  # last few inbound requests for debugging
 
 @app.on_event("startup")
 async def _startup():
@@ -62,7 +36,6 @@ def _now_iso() -> str:
     return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 
 def _normalize_model_id(name: str) -> str:
-    # Accept "model:latest" or "model:anytag" → "model"
     return (name or "").split(":", 1)[0]
 
 def _map_ollama_options_to_openai(opts: Dict[str, Any]) -> Dict[str, Any]:
@@ -73,7 +46,7 @@ def _map_ollama_options_to_openai(opts: Dict[str, Any]) -> Dict[str, Any]:
     if "stop" in opts:        out["stop"] = opts["stop"]
     if "frequency_penalty" in opts: out["frequency_penalty"] = float(opts["frequency_penalty"])
     if "presence_penalty" in opts:  out["presence_penalty"]  = float(opts["presence_penalty"])
-    if "repetition_penalty" in opts: out["frequency_penalty"] = float(opts["repetition_penalty"])  # best-effort
+    if "repetition_penalty" in opts: out["frequency_penalty"] = float(opts["repetition_penalty"])
     return out
 
 async def _retry_request(method: str, url: str, **kwargs) -> httpx.Response:
@@ -100,11 +73,34 @@ def _passthrough_or_json(resp: httpx.Response):
     except Exception:
         return PlainTextResponse(resp.text, status_code=resp.status_code)
 
+# ---------- Request logging middleware (fixed) ----------
+
+@app.middleware("http")
+async def _log_every_request(request: Request, call_next):
+    # Read the body safely
+    body = await request.body()
+
+    # Record a small debug entry
+    _last_calls.append({
+        "ts": time.time(),
+        "method": request.method,
+        "path": request.url.path,
+        "query": str(request.url.query),
+        "body": (body.decode("utf-8", errors="ignore") if body else None)[:512],
+    })
+    if len(_last_calls) > 50:
+        del _last_calls[:-50]
+
+    # Re-inject the body for downstream handling
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+    request._receive = receive  # type: ignore[attr-defined]
+
+    return await call_next(request)
+
 # ----- Stream translators (OpenAI SSE → Ollama NDJSON) -----
 
-async def _stream_openai_to_ollama_chat(
-    upstream_resp: httpx.Response, model: str, started: float
-) -> AsyncIterator[bytes]:
+async def _stream_openai_to_ollama_chat(upstream_resp: httpx.Response, model: str, started: float) -> AsyncIterator[bytes]:
     total_tokens = 0
     async for raw in upstream_resp.aiter_lines():
         if not raw:
@@ -142,9 +138,7 @@ async def _stream_openai_to_ollama_chat(
             }
             yield (json.dumps(out) + "\n").encode("utf-8")
 
-async def _stream_openai_to_ollama_generate(
-    upstream_resp: httpx.Response, model: str, started: float
-) -> AsyncIterator[bytes]:
+async def _stream_openai_to_ollama_generate(upstream_resp: httpx.Response, model: str, started: float) -> AsyncIterator[bytes]:
     total_tokens = 0
     async for raw in upstream_resp.aiter_lines():
         if not raw:
@@ -184,6 +178,10 @@ async def _stream_openai_to_ollama_generate(
 
 # ---------- Ollama-compatible routes ----------
 
+@app.get("/")
+async def root():
+    return {"ok": True, "proxy": "ollama+openai", "upstream": VLLM_BASE_URL}
+
 @app.get("/api/version")
 async def api_version():
     return {"version": "0.1.0-proxy"}
@@ -202,7 +200,6 @@ async def api_tags():
     r = await _retry_request("GET", f"{VLLM_BASE_URL}/v1/models")
     if r.status_code >= 400:
         return _passthrough_or_json(r)
-
     models = []
     for m in r.json().get("data", []):
         mid = m.get("id", "")
@@ -258,7 +255,7 @@ async def api_chat(request: Request):
                                  media_type="application/x-ndjson")
     else:
         upstream = await _retry_request("POST", f"{VLLM_BASE_URL}/v1/chat/completions", json=payload)
-        return _passthrough_or_json(upstream)  # let client parse OpenAI object or error
+        return _passthrough_or_json(upstream)
 
 @app.post("/api/generate")
 async def api_generate(request: Request):
@@ -292,7 +289,7 @@ async def api_embeddings(request: Request):
                                     json={"model": model, "input": input_list})
     return _passthrough_or_json(upstream)
 
-# ---------- EXTRA: Open WebUI sometimes calls /api/chat/completions (OpenAI shape under /api)
+# Some UIs send OpenAI-shaped bodies under /api/*
 @app.post("/api/chat/completions")
 async def api_chat_completions_alias(request: Request):
     body = await request.json()
