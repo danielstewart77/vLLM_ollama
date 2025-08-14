@@ -3,7 +3,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 import httpx, os, asyncio, json, time, datetime
-from typing import AsyncIterator, Dict, Any, Optional
+from typing import AsyncIterator, Dict, Any, Optional, List, TypedDict
 
 # Upstream OpenAI-compatible server (vLLM or similar)
 VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://localhost:7000")
@@ -12,11 +12,18 @@ REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "600"))
 app = FastAPI(title="Ollama + OpenAI Drop-in Proxy → vLLM")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True
+    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True,
 )
 
 client: Optional[httpx.AsyncClient] = None
-_last_calls = []  # last few inbound requests for debugging
+
+class CallLog(TypedDict, total=False):
+    ts: float
+    method: str
+    path: str
+    query: str
+
+_last_calls: List[CallLog] = []  # debug ring buffer
 
 @app.on_event("startup")
 async def _startup():
@@ -33,9 +40,15 @@ async def _shutdown():
 # ---------- Helpers ----------
 
 def _now_iso() -> str:
-    return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+    return (
+        datetime.datetime.utcnow()
+        .replace(tzinfo=datetime.timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 def _normalize_model_id(name: str) -> str:
+    # Accept "model:latest" or "model:anytag" → "model"
     return (name or "").split(":", 1)[0]
 
 def _map_ollama_options_to_openai(opts: Dict[str, Any]) -> Dict[str, Any]:
@@ -46,7 +59,7 @@ def _map_ollama_options_to_openai(opts: Dict[str, Any]) -> Dict[str, Any]:
     if "stop" in opts:        out["stop"] = opts["stop"]
     if "frequency_penalty" in opts: out["frequency_penalty"] = float(opts["frequency_penalty"])
     if "presence_penalty" in opts:  out["presence_penalty"]  = float(opts["presence_penalty"])
-    if "repetition_penalty" in opts: out["frequency_penalty"] = float(opts["repetition_penalty"])
+    if "repetition_penalty" in opts: out["frequency_penalty"] = float(opts["repetition_penalty"])  # best-effort
     return out
 
 async def _retry_request(method: str, url: str, **kwargs) -> httpx.Response:
@@ -73,29 +86,22 @@ def _passthrough_or_json(resp: httpx.Response):
     except Exception:
         return PlainTextResponse(resp.text, status_code=resp.status_code)
 
-# ---------- Request logging middleware (fixed) ----------
+# ---------- Request logging middleware (no body interception) ----------
 
 @app.middleware("http")
 async def _log_every_request(request: Request, call_next):
-    # Read the body safely
-    body = await request.body()
-
-    # Record a small debug entry
-    _last_calls.append({
-        "ts": time.time(),
-        "method": request.method,
-        "path": request.url.path,
-        "query": str(request.url.query),
-        "body": (body.decode("utf-8", errors="ignore") if body else None)[:512],
-    })
-    if len(_last_calls) > 50:
-        del _last_calls[:-50]
-
-    # Re-inject the body for downstream handling
-    async def receive():
-        return {"type": "http.request", "body": body, "more_body": False}
-    request._receive = receive  # type: ignore[attr-defined]
-
+    try:
+        _last_calls.append({
+            "ts": time.time(),
+            "method": request.method,
+            "path": request.url.path,
+            "query": str(request.url.query),
+        })
+        if len(_last_calls) > 100:
+            del _last_calls[:-100]
+    except Exception:
+        # never let logging break the request flow
+        pass
     return await call_next(request)
 
 # ----- Stream translators (OpenAI SSE → Ollama NDJSON) -----
@@ -320,7 +326,11 @@ async def healthz():
 
 @app.get("/_debug")
 async def _debug():
-    return {"last_calls": _last_calls[-10:]}
+    # Always return valid JSON
+    try:
+        return {"last_calls": _last_calls[-10:]}
+    except Exception as e:
+        return JSONResponse({"error": str(e), "last_calls_len": len(_last_calls)}, status_code=500)
 
 # ---------- OpenAI-compatible routes (for clients that use /v1/*) ----------
 
