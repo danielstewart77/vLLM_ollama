@@ -9,16 +9,40 @@ from typing import AsyncIterator, Dict, Any, Optional
 VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://localhost:7000")
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "600"))
 
-app = FastAPI(title="Ollama + OpenAI Drop-in Proxy → vLLM (OpenAI-compatible)")
+app = FastAPI(title="Ollama + OpenAI Drop-in Proxy → vLLM")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-    allow_credentials=True,
+    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True
 )
 
 client: Optional[httpx.AsyncClient] = None
+_last_calls = []  # tiny in-memory ring for quick debugging
+
+@app.middleware("http")
+async def _log_every_request(request: Request, call_next):
+    try:
+        body = None
+        if request.method in ("POST", "PUT", "PATCH"):
+            body = await request.body()
+        _last_calls.append({
+            "ts": time.time(),
+            "method": request.method,
+            "path": request.url.path,
+            "query": str(request.url.query),
+            "body": (body.decode("utf-8", errors="ignore") if body else None)[:512],
+        })
+        # keep last 30
+        if len(_last_calls) > 30:
+            del _last_calls[:-30]
+        # re-inject body for downstream handlers
+        async def bodygen():
+            if body is not None:
+                yield body
+        request._receive = lambda: asyncio.get_event_loop().create_task(asyncio.sleep(0))  # type: ignore
+        response = await call_next(request)
+        return response
+    except Exception:
+        return await call_next(request)
 
 @app.on_event("startup")
 async def _startup():
@@ -42,7 +66,6 @@ def _normalize_model_id(name: str) -> str:
     return (name or "").split(":", 1)[0]
 
 def _map_ollama_options_to_openai(opts: Dict[str, Any]) -> Dict[str, Any]:
-    # Map common generation knobs
     out: Dict[str, Any] = {}
     if "temperature" in opts: out["temperature"] = float(opts["temperature"])
     if "top_p" in opts:       out["top_p"] = float(opts["top_p"])
@@ -107,11 +130,8 @@ async def _stream_openai_to_ollama_chat(
             j = json.loads(data)
         except Exception:
             continue
-        piece = ""
-        try:
-            piece = j["choices"][0].get("delta", {}).get("content", "") or j["choices"][0].get("text", "")
-        except Exception:
-            pass
+        piece = j.get("choices", [{}])[0].get("delta", {}).get("content", "") or \
+                j.get("choices", [{}])[0].get("text", "")
         if piece:
             total_tokens += 1
             out = {
@@ -150,12 +170,8 @@ async def _stream_openai_to_ollama_generate(
             j = json.loads(data)
         except Exception:
             continue
-        piece = ""
-        try:
-            ch = j["choices"][0]
-            piece = ch.get("text") or ch.get("delta", {}).get("content", "")
-        except Exception:
-            pass
+        piece = j.get("choices", [{}])[0].get("text") or \
+                j.get("choices", [{}])[0].get("delta", {}).get("content", "")
         if piece:
             total_tokens += 1
             out = {
@@ -165,7 +181,6 @@ async def _stream_openai_to_ollama_generate(
                 "done": False,
             }
             yield (json.dumps(out) + "\n").encode("utf-8")
-
 
 # ---------- Ollama-compatible routes ----------
 
@@ -184,10 +199,6 @@ async def api_ps():
 
 @app.get("/api/tags")
 async def api_tags():
-    """
-    Return Ollama-style model list.
-      { "models": [ { "name": "model:tag", "model": "model", ... }, ... ] }
-    """
     r = await _retry_request("GET", f"{VLLM_BASE_URL}/v1/models")
     if r.status_code >= 400:
         return _passthrough_or_json(r)
@@ -198,7 +209,6 @@ async def api_tags():
         if not mid:
             continue
         base = _normalize_model_id(mid)
-        # Show a friendly tag to UIs; keep base as "model"
         pretty = f"{base}:latest" if ":" not in mid else mid
         models.append({
             "name": pretty,
@@ -235,7 +245,6 @@ async def api_chat(request: Request):
     messages = body.get("messages", [])
     stream = bool(body.get("stream", True))
     options = body.get("options", {}) or {}
-
     payload = {"model": model, "messages": messages, **_map_ollama_options_to_openai(options)}
 
     if stream:
@@ -249,23 +258,7 @@ async def api_chat(request: Request):
                                  media_type="application/x-ndjson")
     else:
         upstream = await _retry_request("POST", f"{VLLM_BASE_URL}/v1/chat/completions", json=payload)
-        if upstream.status_code >= 400:
-            return _passthrough_or_json(upstream)
-        data = upstream.json()
-        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        resp = {
-            "model": model,
-            "created_at": _now_iso(),
-            "message": {"role": "assistant", "content": content},
-            "done": True,
-            "total_duration": 0,
-            "load_duration": 0,
-            "prompt_eval_count": 0,
-            "prompt_eval_duration": 0,
-            "eval_count": len(content.split()),
-            "eval_duration": 0,
-        }
-        return JSONResponse(resp, status_code=upstream.status_code)
+        return _passthrough_or_json(upstream)  # let client parse OpenAI object or error
 
 @app.post("/api/generate")
 async def api_generate(request: Request):
@@ -274,7 +267,6 @@ async def api_generate(request: Request):
     prompt = body.get("prompt", "")
     stream = bool(body.get("stream", True))
     options = body.get("options", {}) or {}
-
     payload = {"model": model, "prompt": prompt, **_map_ollama_options_to_openai(options)}
 
     if stream:
@@ -288,23 +280,7 @@ async def api_generate(request: Request):
                                  media_type="application/x-ndjson")
     else:
         upstream = await _retry_request("POST", f"{VLLM_BASE_URL}/v1/completions", json=payload)
-        if upstream.status_code >= 400:
-            return _passthrough_or_json(upstream)
-        data = upstream.json()
-        text = data.get("choices", [{}])[0].get("text", "")
-        resp = {
-            "model": model,
-            "created_at": _now_iso(),
-            "response": text,
-            "done": True,
-            "total_duration": 0,
-            "load_duration": 0,
-            "prompt_eval_count": 0,
-            "prompt_eval_duration": 0,
-            "eval_count": len(text.split()),
-            "eval_duration": 0,
-        }
-        return JSONResponse(resp, status_code=upstream.status_code)
+        return _passthrough_or_json(upstream)
 
 @app.post("/api/embeddings")
 async def api_embeddings(request: Request):
@@ -312,19 +288,29 @@ async def api_embeddings(request: Request):
     model = _normalize_model_id(body.get("model", ""))
     inp = body.get("input") or body.get("prompt") or ""
     input_list = inp if isinstance(inp, list) else [inp]
-
     upstream = await _retry_request("POST", f"{VLLM_BASE_URL}/v1/embeddings",
                                     json={"model": model, "input": input_list})
-    if upstream.status_code >= 400:
-        return _passthrough_or_json(upstream)
-    data = upstream.json()
-    embeddings = [d.get("embedding", []) for d in data.get("data", [])]
-    if len(embeddings) == 1:
-        return JSONResponse({"model": model, "embedding": embeddings[0]}, status_code=upstream.status_code)
-    else:
-        return JSONResponse({"model": model, "embeddings": embeddings}, status_code=upstream.status_code)
+    return _passthrough_or_json(upstream)
 
-# Optional health
+# ---------- EXTRA: Open WebUI sometimes calls /api/chat/completions (OpenAI shape under /api)
+@app.post("/api/chat/completions")
+async def api_chat_completions_alias(request: Request):
+    body = await request.json()
+    if "model" in body:
+        body["model"] = _normalize_model_id(body["model"])
+    upstream = await _retry_request("POST", f"{VLLM_BASE_URL}/v1/chat/completions", json=body)
+    return _passthrough_or_json(upstream)
+
+@app.post("/api/completions")
+async def api_completions_alias(request: Request):
+    body = await request.json()
+    if "model" in body:
+        body["model"] = _normalize_model_id(body["model"])
+    upstream = await _retry_request("POST", f"{VLLM_BASE_URL}/v1/completions", json=body)
+    return _passthrough_or_json(upstream)
+
+# ---------- Health & debug ----------
+
 @app.get("/healthz")
 async def healthz():
     try:
@@ -334,6 +320,10 @@ async def healthz():
         raise e
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
+
+@app.get("/_debug")
+async def _debug():
+    return {"last_calls": _last_calls[-10:]}
 
 # ---------- OpenAI-compatible routes (for clients that use /v1/*) ----------
 
