@@ -47,9 +47,6 @@ def _now_iso() -> str:
         .replace("+00:00", "Z")
     )
 
-def _normalize_model_id(name: str) -> str:
-    # Accept "model:latest" or "model:anytag" → "model"
-    return (name or "").split(":", 1)[0]
 
 def _map_ollama_options_to_openai(opts: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
@@ -211,11 +208,10 @@ async def api_tags():
         mid = m.get("id", "")
         if not mid:
             continue
-        base = _normalize_model_id(mid)
-        pretty = f"{base}:latest" if ":" not in mid else mid
+        pretty = mid
         models.append({
             "name": pretty,
-            "model": base,
+            "model": mid,
             "modified_at": _now_iso(),
             "size": 0,
             "digest": "",
@@ -244,7 +240,7 @@ async def api_show(request: Request):
 @app.post("/api/chat")
 async def api_chat(request: Request):
     body = await request.json()
-    model = _normalize_model_id(body.get("model", ""))
+    model = body.get("model", "")
     messages = body.get("messages", [])
     stream = bool(body.get("stream", True))
     options = body.get("options", {}) or {}
@@ -266,7 +262,7 @@ async def api_chat(request: Request):
 @app.post("/api/generate")
 async def api_generate(request: Request):
     body = await request.json()
-    model = _normalize_model_id(body.get("model", ""))
+    model = body.get("model", "")
     prompt = body.get("prompt", "")
     stream = bool(body.get("stream", True))
     options = body.get("options", {}) or {}
@@ -288,7 +284,7 @@ async def api_generate(request: Request):
 @app.post("/api/embeddings")
 async def api_embeddings(request: Request):
     body = await request.json()
-    model = _normalize_model_id(body.get("model", ""))
+    model = body.get("model", "")
     inp = body.get("input") or body.get("prompt") or ""
     input_list = inp if isinstance(inp, list) else [inp]
     upstream = await _retry_request("POST", f"{VLLM_BASE_URL}/v1/embeddings",
@@ -299,16 +295,14 @@ async def api_embeddings(request: Request):
 @app.post("/api/chat/completions")
 async def api_chat_completions_alias(request: Request):
     body = await request.json()
-    if "model" in body:
-        body["model"] = _normalize_model_id(body["model"])
+    # pass model unmodified
     upstream = await _retry_request("POST", f"{VLLM_BASE_URL}/v1/chat/completions", json=body)
     return _passthrough_or_json(upstream)
 
 @app.post("/api/completions")
 async def api_completions_alias(request: Request):
     body = await request.json()
-    if "model" in body:
-        body["model"] = _normalize_model_id(body["model"])
+    # pass model unmodified
     upstream = await _retry_request("POST", f"{VLLM_BASE_URL}/v1/completions", json=body)
     return _passthrough_or_json(upstream)
 
@@ -342,23 +336,20 @@ async def v1_models():
 @app.post("/v1/chat/completions")
 async def v1_chat_completions(request: Request):
     body = await request.json()
-    if "model" in body:
-        body["model"] = _normalize_model_id(body["model"])
+    # pass model unmodified
     r = await _retry_request("POST", f"{VLLM_BASE_URL}/v1/chat/completions", json=body)
     return _passthrough_or_json(r)
 
 @app.post("/v1/completions")
 async def v1_completions(request: Request):
     body = await request.json()
-    if "model" in body:
-        body["model"] = _normalize_model_id(body["model"])
+    # pass model unmodified
     r = await _retry_request("POST", f"{VLLM_BASE_URL}/v1/completions", json=body)
     return _passthrough_or_json(r)
 
 @app.post("/v1/embeddings")
 async def v1_embeddings(request: Request):
     body = await request.json()
-    if "model" in body:
-        body["model"] = _normalize_model_id(body["model"])
+    # pass model unmodified
     r = await _retry_request("POST", f"{VLLM_BASE_URL}/v1/embeddings", json=body)
     return _passthrough_or_json(r)
