@@ -9,10 +9,13 @@ from typing import AsyncIterator, Dict, Any, Optional
 VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://localhost:7000")
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "600"))
 
-app = FastAPI(title="Ollama Drop-in Proxy → vLLM (OpenAI-compatible)")
+app = FastAPI(title="Ollama + OpenAI Drop-in Proxy → vLLM (OpenAI-compatible)")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=True,
 )
 
 client: Optional[httpx.AsyncClient] = None
@@ -32,7 +35,11 @@ async def _shutdown():
 # ---------- Helpers ----------
 
 def _now_iso() -> str:
-    return datetime.datetime.utcnow().isoformat() + "Z"
+    return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+def _normalize_model_id(name: str) -> str:
+    # Accept "model:latest" or "model:anytag" → "model"
+    return (name or "").split(":", 1)[0]
 
 def _map_ollama_options_to_openai(opts: Dict[str, Any]) -> Dict[str, Any]:
     # Map common generation knobs
@@ -41,20 +48,10 @@ def _map_ollama_options_to_openai(opts: Dict[str, Any]) -> Dict[str, Any]:
     if "top_p" in opts:       out["top_p"] = float(opts["top_p"])
     if "max_tokens" in opts:  out["max_tokens"] = int(opts["max_tokens"])
     if "stop" in opts:        out["stop"] = opts["stop"]
-    # Ollama uses "repeat_penalty"/"frequency_penalty" sometimes
     if "frequency_penalty" in opts: out["frequency_penalty"] = float(opts["frequency_penalty"])
     if "presence_penalty" in opts:  out["presence_penalty"]  = float(opts["presence_penalty"])
     if "repetition_penalty" in opts: out["frequency_penalty"] = float(opts["repetition_penalty"])  # best-effort
     return out
-
-def _passthrough_or_json(resp: httpx.Response):
-    if resp.status_code >= 400:
-        return PlainTextResponse(resp.text or resp.content, status_code=resp.status_code,
-                                 media_type=resp.headers.get("content-type","text/plain"))
-    try:
-        return JSONResponse(resp.json(), status_code=resp.status_code)
-    except Exception:
-        return PlainTextResponse(resp.text, status_code=resp.status_code)
 
 async def _retry_request(method: str, url: str, **kwargs) -> httpx.Response:
     assert client is not None
@@ -68,21 +65,29 @@ async def _retry_request(method: str, url: str, **kwargs) -> httpx.Response:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 8.0)
 
+def _passthrough_or_json(resp: httpx.Response):
+    if resp.status_code >= 400:
+        return PlainTextResponse(
+            resp.text or resp.content,
+            status_code=resp.status_code,
+            media_type=resp.headers.get("content-type", "text/plain"),
+        )
+    try:
+        return JSONResponse(resp.json(), status_code=resp.status_code)
+    except Exception:
+        return PlainTextResponse(resp.text, status_code=resp.status_code)
+
+# ----- Stream translators (OpenAI SSE → Ollama NDJSON) -----
+
 async def _stream_openai_to_ollama_chat(
     upstream_resp: httpx.Response, model: str, started: float
 ) -> AsyncIterator[bytes]:
-    # vLLM streams SSE: "data: {...}\n\n" with choices[0].delta.content
     total_tokens = 0
     async for raw in upstream_resp.aiter_lines():
         if not raw:
             continue
-        if raw.startswith("data: "):
-            data = raw[len("data: "):]
-        else:
-            # some servers don’t prefix; try as-is
-            data = raw
+        data = raw[6:] if raw.startswith("data: ") else raw
         if data.strip() == "[DONE]":
-            # Final Ollama-style "done" line with rough stats
             elapsed_ns = int((time.time() - started) * 1e9)
             final = {
                 "model": model,
@@ -101,14 +106,10 @@ async def _stream_openai_to_ollama_chat(
         try:
             j = json.loads(data)
         except Exception:
-            # pass-through textual chunks if any
             continue
-        # OpenAI chat delta path
         piece = ""
         try:
-            piece = j["choices"][0].get("delta", {}).get("content", "")
-            if not piece and "text" in j["choices"][0]:
-                piece = j["choices"][0]["text"]
+            piece = j["choices"][0].get("delta", {}).get("content", "") or j["choices"][0].get("text", "")
         except Exception:
             pass
         if piece:
@@ -128,10 +129,7 @@ async def _stream_openai_to_ollama_generate(
     async for raw in upstream_resp.aiter_lines():
         if not raw:
             continue
-        if raw.startswith("data: "):
-            data = raw[len("data: "):]
-        else:
-            data = raw
+        data = raw[6:] if raw.startswith("data: ") else raw
         if data.strip() == "[DONE]":
             elapsed_ns = int((time.time() - started) * 1e9)
             final = {
@@ -154,7 +152,6 @@ async def _stream_openai_to_ollama_generate(
             continue
         piece = ""
         try:
-            # completions or chat-completions both supported
             ch = j["choices"][0]
             piece = ch.get("text") or ch.get("delta", {}).get("content", "")
         except Exception:
@@ -169,76 +166,60 @@ async def _stream_openai_to_ollama_generate(
             }
             yield (json.dumps(out) + "\n").encode("utf-8")
 
-def _normalize_model_id(name: str) -> str:
-    # Accept things like "model:latest" or "model:Q4_K_M"
-    # vLLM typically serves the base id (left of the first colon).
-    return (name or "").split(":", 1)[0]
-
 
 # ---------- Ollama-compatible routes ----------
+
+@app.get("/api/version")
+async def api_version():
+    return {"version": "0.1.0-proxy"}
+
+@app.get("/api/ps")
+async def api_ps():
+    r = await _retry_request("GET", f"{VLLM_BASE_URL}/v1/models")
+    if r.status_code >= 400:
+        return _passthrough_or_json(r)
+    data = r.json()
+    procs = [{"model": m.get("id", ""), "size": 0, "digest": ""} for m in data.get("data", [])]
+    return {"models": procs}
 
 @app.get("/api/tags")
 async def api_tags():
     """
-    Ollama-style tags:
+    Return Ollama-style model list.
       { "models": [ { "name": "model:tag", "model": "model", ... }, ... ] }
-    We map from /v1/models ids and synthesize minimal metadata.
     """
     r = await _retry_request("GET", f"{VLLM_BASE_URL}/v1/models")
-    try:
-        data = r.json()
-    except Exception:
-        return PlainTextResponse(r.text, status_code=r.status_code)
+    if r.status_code >= 400:
+        return _passthrough_or_json(r)
 
     models = []
-    for m in data.get("data", []):
-        name = m.get("id", "")
-        if not name:
+    for m in r.json().get("data", []):
+        mid = m.get("id", "")
+        if not mid:
             continue
-        base = name.split(":", 1)[0]  # best-effort base name
+        base = _normalize_model_id(mid)
+        # Show a friendly tag to UIs; keep base as "model"
+        pretty = f"{base}:latest" if ":" not in mid else mid
         models.append({
-            "name": name,
+            "name": pretty,
             "model": base,
             "modified_at": _now_iso(),
             "size": 0,
             "digest": "",
             "details": {"parent_model": "", "format": "pytorch", "families": []},
         })
-    return JSONResponse({"models": models}, status_code=r.status_code)
+    return {"models": models}
 
-# Some UIs call /api/models; mirror /api/tags for compatibility.
 @app.get("/api/models")
 async def api_models():
     return await api_tags()
 
-
-@app.get("/api/version")
-async def api_version():
-    # Mimic Ollama's version format
-    return {"version": "0.1.0-proxy"}
-
-@app.get("/api/ps")
-async def api_ps():
-    # Minimal process list; Ollama returns running models.
-    # We'll map to available models for now.
-    # If you want true "running" semantics, we can track active sessions.
-    r = await _retry_request("GET", f"{VLLM_BASE_URL}/v1/models")
-    try:
-        data = r.json()
-    except Exception:
-        # Pass upstream error through
-        return PlainTextResponse(r.text, status_code=r.status_code)
-    procs = [{"model": m.get("id", ""), "size": 0, "digest": ""} for m in data.get("data", [])]
-    return {"models": procs}
-
 @app.post("/api/show")
 async def api_show(request: Request):
-    # Ollama usually accepts {"name":"model"} and returns metadata.
     body = await request.json()
     name = body.get("name") or body.get("model") or ""
     if not name:
         return JSONResponse({"error": "missing model name"}, status_code=400)
-    # Best-effort metadata
     return {
         "model": name,
         "modified_at": _now_iso(),
@@ -247,56 +228,31 @@ async def api_show(request: Request):
         "details": {"parent_model": "", "format": "pytorch", "families": []},
     }
 
-
 @app.post("/api/chat")
 async def api_chat(request: Request):
-    """
-    Ollama-style request:
-    {
-      "model": "granite-8b",
-      "messages": [{"role":"system","content":"..."}, {"role":"user","content":"..."}],
-      "stream": true,
-      "options": { "temperature": 0.2, "top_p": 0.95, ... }
-    }
-    Streamed response: NDJSON lines with {"message":{"role":"assistant","content":"..."}, "done": false}
-    Final line includes {"done": true, stats...}
-    """
     body = await request.json()
-    model_in = body.get("model", "")
-    model = _normalize_model_id(model_in)
+    model = _normalize_model_id(body.get("model", ""))
     messages = body.get("messages", [])
     stream = bool(body.get("stream", True))
     options = body.get("options", {}) or {}
 
-    openai_payload = {
-        "model": model,
-        "messages": messages,
-        **_map_ollama_options_to_openai(options),
-    }
+    payload = {"model": model, "messages": messages, **_map_ollama_options_to_openai(options)}
 
     if stream:
-        openai_payload["stream"] = True
+        payload["stream"] = True
         upstream = await _retry_request(
             "POST", f"{VLLM_BASE_URL}/v1/chat/completions",
-            json=openai_payload, headers={"accept": "text/event-stream"}
+            json=payload, headers={"accept": "text/event-stream"}
         )
         started = time.time()
-        return StreamingResponse(
-            _stream_openai_to_ollama_chat(upstream, model, started),
-            media_type="application/x-ndjson"
-        )
+        return StreamingResponse(_stream_openai_to_ollama_chat(upstream, model, started),
+                                 media_type="application/x-ndjson")
     else:
-        upstream = await _retry_request(
-            "POST", f"{VLLM_BASE_URL}/v1/chat/completions",
-            json=openai_payload
-        )
-        try:
-            data = upstream.json()
-        except Exception:
-            return PlainTextResponse(upstream.text, status_code=upstream.status_code)
-
+        upstream = await _retry_request("POST", f"{VLLM_BASE_URL}/v1/chat/completions", json=payload)
+        if upstream.status_code >= 400:
+            return _passthrough_or_json(upstream)
+        data = upstream.json()
         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        # Non-stream one-shot Ollama-style response
         resp = {
             "model": model,
             "created_at": _now_iso(),
@@ -313,47 +269,28 @@ async def api_chat(request: Request):
 
 @app.post("/api/generate")
 async def api_generate(request: Request):
-    """
-    Ollama-style request:
-    {
-      "model": "granite-8b",
-      "prompt": "Write a haiku",
-      "stream": true,
-      "options": { ... }
-    }
-    """
     body = await request.json()
-    model_in = body.get("model", "")
-    model = _normalize_model_id(model_in)
+    model = _normalize_model_id(body.get("model", ""))
     prompt = body.get("prompt", "")
     stream = bool(body.get("stream", True))
     options = body.get("options", {}) or {}
 
-    # Prefer /v1/completions for plain prompts. If missing upstream, we can fallback to chat.
-    openai_payload = {
-        "model": model,
-        "prompt": prompt,
-        **_map_ollama_options_to_openai(options),
-    }
+    payload = {"model": model, "prompt": prompt, **_map_ollama_options_to_openai(options)}
 
     if stream:
-        openai_payload["stream"] = True
+        payload["stream"] = True
         upstream = await _retry_request(
             "POST", f"{VLLM_BASE_URL}/v1/completions",
-            json=openai_payload, headers={"accept": "text/event-stream"}
+            json=payload, headers={"accept": "text/event-stream"}
         )
         started = time.time()
-        return StreamingResponse(
-            _stream_openai_to_ollama_generate(upstream, model, started),
-            media_type="application/x-ndjson"
-        )
+        return StreamingResponse(_stream_openai_to_ollama_generate(upstream, model, started),
+                                 media_type="application/x-ndjson")
     else:
-        upstream = await _retry_request("POST", f"{VLLM_BASE_URL}/v1/completions", json=openai_payload)
-        try:
-            data = upstream.json()
-        except Exception:
-            return PlainTextResponse(upstream.text, status_code=upstream.status_code)
-
+        upstream = await _retry_request("POST", f"{VLLM_BASE_URL}/v1/completions", json=payload)
+        if upstream.status_code >= 400:
+            return _passthrough_or_json(upstream)
+        data = upstream.json()
         text = data.get("choices", [{}])[0].get("text", "")
         resp = {
             "model": model,
@@ -371,32 +308,17 @@ async def api_generate(request: Request):
 
 @app.post("/api/embeddings")
 async def api_embeddings(request: Request):
-    """
-    Ollama-style request:
-    { "model": "granite-embed", "input": "text" }
-    Ollama also accepts { "prompt": "..." }. We'll accept either.
-    """
     body = await request.json()
-    model_in = body.get("model", "")
-    model = _normalize_model_id(model_in)
+    model = _normalize_model_id(body.get("model", ""))
     inp = body.get("input") or body.get("prompt") or ""
-    if isinstance(inp, list):
-        input_list = inp
-    else:
-        input_list = [inp]
+    input_list = inp if isinstance(inp, list) else [inp]
 
-    upstream = await _retry_request(
-        "POST", f"{VLLM_BASE_URL}/v1/embeddings",
-        json={"model": model, "input": input_list}
-    )
-    try:
-        data = upstream.json()
-    except Exception:
-        return PlainTextResponse(upstream.text, status_code=upstream.status_code)
-
-    # OpenAI format: {data:[{embedding:[...]}]}
+    upstream = await _retry_request("POST", f"{VLLM_BASE_URL}/v1/embeddings",
+                                    json={"model": model, "input": input_list})
+    if upstream.status_code >= 400:
+        return _passthrough_or_json(upstream)
+    data = upstream.json()
     embeddings = [d.get("embedding", []) for d in data.get("data", [])]
-    # Ollama returns a single vector for single input
     if len(embeddings) == 1:
         return JSONResponse({"model": model, "embedding": embeddings[0]}, status_code=upstream.status_code)
     else:
@@ -412,3 +334,34 @@ async def healthz():
         raise e
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
+
+# ---------- OpenAI-compatible routes (for clients that use /v1/*) ----------
+
+@app.get("/v1/models")
+async def v1_models():
+    r = await _retry_request("GET", f"{VLLM_BASE_URL}/v1/models")
+    return _passthrough_or_json(r)
+
+@app.post("/v1/chat/completions")
+async def v1_chat_completions(request: Request):
+    body = await request.json()
+    if "model" in body:
+        body["model"] = _normalize_model_id(body["model"])
+    r = await _retry_request("POST", f"{VLLM_BASE_URL}/v1/chat/completions", json=body)
+    return _passthrough_or_json(r)
+
+@app.post("/v1/completions")
+async def v1_completions(request: Request):
+    body = await request.json()
+    if "model" in body:
+        body["model"] = _normalize_model_id(body["model"])
+    r = await _retry_request("POST", f"{VLLM_BASE_URL}/v1/completions", json=body)
+    return _passthrough_or_json(r)
+
+@app.post("/v1/embeddings")
+async def v1_embeddings(request: Request):
+    body = await request.json()
+    if "model" in body:
+        body["model"] = _normalize_model_id(body["model"])
+    r = await _retry_request("POST", f"{VLLM_BASE_URL}/v1/embeddings", json=body)
+    return _passthrough_or_json(r)
