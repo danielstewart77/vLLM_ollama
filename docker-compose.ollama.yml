@@ -36,6 +36,8 @@ services:
       - ./hf_cache:/root/.cache/huggingface
     ports:
       - "7000:7000"
+    networks:
+      - vllmnet
 
   ollama-proxy:
     build:
@@ -50,3 +52,8 @@ services:
       - "3000:3000"
     volumes:
       - ./hf_cache:/root/.cache/huggingface
+    networks:
+      - vllmnet
+
+networks:
+  vllmnet:
