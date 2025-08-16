@@ -1,17 +1,79 @@
 services:
-  openai-proxy:
-    build: .
+  vllm:
+    image: vllm/vllm-openai:latest
     container_name: vllm
-    ports:
-      - "3000:3000"  # FastAPI
-      - "7000:7000"  # vLLM
-    environment:
-      VLLM_BASE_URL: http://localhost:7000  # Updated URL
-    volumes:
-      - ./hf_cache:/root/.cache/huggingface  # Persistent model cache
     runtime: nvidia
+    command:
+      - --model
+      - ibm-granite/granite-3.3-8b-instruct
+      - --served-model-name
+      - ibm-granite/granite-3.3-8b-instruct:latest
+      - --host
+      - 0.0.0.0
+      - --port
+      - "7000"
+      - --tensor-parallel-size
+      - "2"
+      - --dtype
+      - bfloat16
+      - --gpu-memory-utilization
+      - "0.70"
+      - --max-model-len
+      - "16384"
+      - --max-num-seqs
+      - "4"
+      - --max-num-batched-tokens
+      - "16384"
+      - --enforce-eager
+      - --trust-remote-code
+    environment:
+      - CUDA_VISIBLE_DEVICES=0,1
+      - NCCL_DEBUG=INFO
+      - NCCL_IB_DISABLE=1
+      # If shm still fills up, uncomment the next line:
+      # - NCCL_SHM_DISABLE=1
     deploy:
       resources:
         reservations:
           devices:
             - capabilities: [gpu]
+    shm_size: "16g"
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    volumes:
+      - ./hf_cache:/root/.cache/huggingface
+    ports:
+      - "7000:7000"
+    networks:
+      - vllmnet
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:7000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  ollama-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ollama-proxy
+    environment:
+      - VLLM_BASE_URL=http://vllm:7000
+    depends_on:
+      vllm:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./hf_cache:/root/.cache/huggingface
+    networks:
+      - vllmnet
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/_debug"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+networks:
+  vllmnet:

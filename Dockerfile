@@ -11,14 +11,14 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 # Copy application files
-COPY main.py /app/main.py
-COPY run_vllm.sh /app/run_vllm.sh
+COPY ollama_api.py /app/ollama_api.py
+COPY run_vllm_ollama.sh /app/run_vllm_ollama.sh
 WORKDIR /app
 
 # Set permissions
-RUN chmod +x /app/run_vllm.sh
+RUN chmod +x /app/run_vllm_ollama.sh
 
 # Expose FastAPI and vLLM ports
 EXPOSE 3000 7000
 
-CMD ["bash", "/app/run_vllm.sh"]
+CMD ["bash", "/app/run_vllm_ollama.sh"]
