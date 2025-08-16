@@ -1,25 +1,22 @@
+# docker-compose.ollama.yml  (only vllm service shown)
 services:
   vllm:
-    image: vllm/vllm-openai:gptoss
+    image: vllm/vllm-openai:gptoss   # <-- gpt-oss–ready build
     container_name: vllm
     runtime: nvidia
     command:
       - --model
       - openai/gpt-oss-20b
-      - --served-model-name
-      - openai/gpt-osa-20b:latest
       - --host
       - 0.0.0.0
       - --port
       - "7000"
+      # TP=1 is fine on a single A5000; keep TP=2 if you like spreading across both
       - --tensor-parallel-size
       - "1"
-    #  - --dtype
-    #  - bfloat16
-      - --gpu-memory-utilization
-      - "0.70"
+      # Let vLLM pick the right kernels/quantization for gpt-oss; no need to force dtype
       - --max-model-len
-      - "131072"
+      - "131072"            # 128k
       - --max-num-seqs
       - "4"
       - --max-num-batched-tokens
@@ -27,10 +24,10 @@ services:
       - --enforce-eager
       - --trust-remote-code
     environment:
-      - CUDA_VISIBLE_DEVICES=0,1
+      - CUDA_VISIBLE_DEVICES=1
       - NCCL_DEBUG=INFO
       - NCCL_IB_DISABLE=1
-      # If shm still fills up, uncomment the next line:
+      # If shared memory congestion appears in logs, optionally:
       # - NCCL_SHM_DISABLE=1
     deploy:
       resources:
@@ -52,28 +49,3 @@ services:
       interval: 10s
       timeout: 3s
       retries: 10
-
-  ollama-proxy:
-    build:
-      context: .
-      dockerfile: Dockerfile.ollama
-    container_name: ollama-proxy
-    environment:
-      - VLLM_BASE_URL=http://vllm:7000
-    depends_on:
-      vllm:
-        condition: service_healthy
-    ports:
-      - "3000:3000"
-    volumes:
-      - ./hf_cache:/root/.cache/huggingface
-    networks:
-      - vllmnet
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:3000/_debug"]
-      interval: 10s
-      timeout: 3s
-      retries: 10
-
-networks:
-  vllmnet:
