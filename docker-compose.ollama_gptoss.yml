@@ -50,27 +50,27 @@ services:
       timeout: 3s
       retries: 10
 
-    ollama-proxy:
-      build:
-        context: .
-        dockerfile: Dockerfile.ollama
-      container_name: ollama-proxy
-      environment:
-        - VLLM_BASE_URL=http://vllm:7000
-      depends_on:
-        vllm:
-          condition: service_healthy
-      ports:
-        - "3000:3000"
-      volumes:
-        - ./hf_cache:/root/.cache/huggingface
-      networks:
-        - vllmnet
-      healthcheck:
-        test: ["CMD", "curl", "-fsS", "http://localhost:3000/_debug"]
-        interval: 10s
-        timeout: 3s
-        retries: 10
+  ollama-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.ollama
+    container_name: ollama-proxy
+    environment:
+      - VLLM_BASE_URL=http://vllm:7000
+    depends_on:
+      vllm:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./hf_cache:/root/.cache/huggingface
+    networks:
+      - vllmnet
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/_debug"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
 
 networks:
   vllmnet:
